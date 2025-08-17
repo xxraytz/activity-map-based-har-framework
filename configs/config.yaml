@@ -1,9 +1,41 @@
 model:
   name: swin_base_patch4_window7_224   # timm‑имя модели
-in_chans: 3                            # 1, 3 или 5
-img_size: [256, 256]                  # или одно число для квадратных
-num_classes: 10
+in_chans: 1                            # 1, 3 или 5
+img_size: [32, 32]                  # или одно число для квадратных
+num_classes: 8
 batch_size: 32
 lr: 3e-4
 weight_decay: 1e-2
 epochs: 30
+num_workers: 0
+
+data:
+  seq_dir: data/tst-fall-detection               # папка с .npz файлами: each contains 'data' and 'labels'
+  manifest: data/tst-fall-detection/manifest.parquet       # создаётся скриптом
+  val_frac: 0.1                         # доля валидации внутри тренировочных актёров
+  window_size: 32                       # длина окна по временной оси
+  window_stride: 1                      # шаг скольжения
+  lopo: 1
+  splits:
+    train: 0.8                       # fraction for training
+    val: 0.1                         # fraction for validation
+    test: 0.1                        # fraction for testing
+  class_names:
+    - standing
+    - sitting
+    - falling
+    - walking
+    - lying
+    - grasp
+    - ungrasp
+    - post-fall-laying
+
+  class_map:
+    grasp: grasp
+    ungrasp: grasp
+    post-fall-laying: lying
+    stand-to-sit: sitting
+    sit-to-stand: standing
+    sit-to-lay: lying
+    lay-to-sit: sitting
+    laying: lying

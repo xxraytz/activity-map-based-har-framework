@@ -210,3 +210,7 @@ __marimo__/
 # Datasets
 data/
 notebook/
+runs/
+
+optuna_reports/
+optuna.db

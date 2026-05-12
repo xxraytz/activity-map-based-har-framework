@@ -1,7 +1,12 @@
+# src/datasets.py
+
+from collections import Counter
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import StratifiedShuffleSplit
+
 
 class SeqWindow(Dataset):
     def __init__(self, recs, win, stride, orig_to_merged, cls2idx, class_names):
@@ -49,18 +54,34 @@ def get_dataloaders(cfg):
     leave = cfg['data']['lopo']
     win = cfg['data']['window_size']
     stride = cfg['data']['window_stride']
-    orig_to_merged = cfg['data'].get('class_map', {})
-    class_names = cfg['data']['class_names']
+    class_map = cfg['data'].get('class_names', {})
+    class_names = set(class_map.values())
     cls2idx = {c: i for i, c in enumerate(class_names)}
 
     # LOPO split
     test_df = df[df.actor_id == leave]
     other = df[df.actor_id != leave].sample(frac=1, random_state=42)
-    n_val = int(len(other) * cfg['data']['val_frac'])
+    
+    # --- доминирующий канонический класс каждой записи (по полному файлу)
+    def majority_canonical(filepath: str) -> str:
+        npz = np.load(filepath, allow_pickle=True)
+        labs = npz['labels']
+        merged = [class_map.get(str(l), str(l)) for l in labs]
+        return Counter(merged).most_common(1)[0][0]
+    
+    other_major = other['filepath'].apply(majority_canonical)
+
+    # --- стратификация other -> train/val
+    val_frac = cfg['data']['val_frac']
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=val_frac, random_state=42)
+    train_idx, val_idx = next(sss.split(other, other_major))
+    train_df = other.iloc[train_idx].reset_index(drop=True)
+    val_df   = other.iloc[val_idx].reset_index(drop=True)
+
     splits = {
-        'train': other.iloc[n_val:].reset_index(drop=True),
-        'val':   other.iloc[:n_val].reset_index(drop=True),
-        'test':  test_df.reset_index(drop=True)
+        'train': train_df,
+        'val':   val_df,
+        'test':  test_df,
     }
 
     def make_loader(split):
@@ -68,7 +89,7 @@ def get_dataloaders(cfg):
             recs=splits[split],
             win=win,
             stride=stride,
-            orig_to_merged=orig_to_merged,
+            orig_to_merged=class_map,
             cls2idx=cls2idx,
             class_names=class_names
         )

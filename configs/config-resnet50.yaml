@@ -1,0 +1,56 @@
+model:
+  name: resnet50   # timm‑имя модели
+  pretrained: False
+
+  # Main config
+in_chans: 1                            # 1, 3 или 5
+img_size: 136                  # или одно число для квадратных
+num_classes: 6
+batch_size: 256
+lr: 1e-4
+weight_decay: 1e-6
+epochs: 100
+num_workers: 4
+device: 'cuda:2'
+mode: 'train'
+
+metrics:
+  names: [accuracy, f1_macro, top_k_accuracy@3, top_k_accuracy@5]
+  eval_every: 5
+
+training:
+  patience: 30
+  min_delta: 0.0
+  lr_scheduler:
+    type: plateau      # или none
+    factor: 0.2        # во сколько раз понижать LR
+    patience: 3        # сколько эпох без улучшения val_loss до понижения LR
+    threshold: 1e-4    # чувствительность к улучшению
+    cooldown: 0
+    min_lr: 1e-6
+    verbose: false
+
+data:
+  seq_dir: data/tst-fall-detection-random/136               # папка с .npz файлами: each contains 'data' and 'labels'
+  manifest: data/tst-fall-detection-random/136/manifest.parquet       # создаётся скриптом
+  val_frac: 0.1                         # доля валидации внутри тренировочных актёров
+  window_size: 136                       # длина окна по временной оси
+  window_stride: 1                      # шаг скольжения
+  lopo: 1
+  splits:
+    train: 0.85                       # fraction for training
+    val: 0.15                         # fraction for validation
+  class_names:
+    standing: standing
+    sit-to-stand: standing
+    walking: walking
+    sitting: sitting
+    stand-to-sit: sitting
+    lay-to-sit: sitting
+    lying: lying
+    laying: lying
+    post-fall-laying: lying
+    sit-to-lay: lying
+    grasp: grasp
+    ungrasp: grasp
+    falling: falling

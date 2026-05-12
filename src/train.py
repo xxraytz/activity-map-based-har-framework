@@ -1,24 +1,31 @@
-import argparse
-import yaml
 import torch
-import torch.nn.functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from .datasets import get_dataloaders
-from .models import build_model
 from .utils import kld_loss
+from tqdm.auto import tqdm
 
 
-def train_epoch(model, loader, opt, device):
+def train_epoch(model, loader, opt, device, epoch: int = None, epochs: int = None):
     model.train()
-    total = 0.0
-    for x, y in loader:
+    running = 0.0
+    seen = 0
+
+    desc = f"Train [{epoch}/{epochs}]" if epoch is not None and epochs is not None else "Train"
+    bar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+
+    for x, y in bar:
         x, y = x.to(device), y.to(device)
         logits = model(x)
         loss = kld_loss(logits, y)
-        opt.zero_grad(); loss.backward(); opt.step()
-        total += loss.item() * x.size(0)
-    return total / len(loader.dataset)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        
+        bs = x.size(0)
+        running += loss.item() * bs
+        seen += bs
+        bar.set_postfix(loss=f"{running/seen:.4f}")
+
+    return running / max(seen, 1)
 
 def validate(model, loader, device):
     model.eval()

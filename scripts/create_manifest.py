@@ -12,7 +12,7 @@ def main():
         description="Generate manifest.parquet for sequence data"
     )
     parser.add_argument(
-        "--seq_dir", type=str, required=True,
+        "--seq-dir", type=str, required=True,
         help="Directory containing .npz sequence files (e.g., data/sequences)"
     )
     parser.add_argument(

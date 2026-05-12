@@ -1,41 +1,62 @@
+# Model config
 model:
-  name: swin_base_patch4_window7_224   # timm‑имя модели
-in_chans: 1                            # 1, 3 или 5
-img_size: [32, 32]                  # или одно число для квадратных
-num_classes: 8
-batch_size: 32
-lr: 3e-4
-weight_decay: 1e-2
-epochs: 30
-num_workers: 0
+  name: resnet50   # timm‑имя модели
+  pretrained: False
 
+# Main config
+in_chans: 1                            # 1, 3 или 5
+img_size: 32                  # или одно число для квадратных
+num_classes: 6
+batch_size: 128
+lr: 0.0015394809610535603
+weight_decay: 1e-6
+epochs: 200
+num_workers: 4
+device: 'cuda:3'
+mode: 'train'
+
+# Training config
+training:
+  patience: 30
+  min_delta: 0.0
+  lr_scheduler:
+    type: plateau      # или none
+    factor: 0.2        # во сколько раз понижать LR
+    patience: 3        # сколько эпох без улучшения val_loss до понижения LR
+    threshold: 1e-4    # чувствительность к улучшению
+    cooldown: 0
+    min_lr: 1e-6
+    verbose: false
+
+# Metrics config
+metrics:
+  names: [accuracy, f1_macro, top_k_accuracy@3, top_k_accuracy@5]
+  eval_every: 5
+
+
+
+# Data config
 data:
-  seq_dir: data/tst-fall-detection               # папка с .npz файлами: each contains 'data' and 'labels'
-  manifest: data/tst-fall-detection/manifest.parquet       # создаётся скриптом
+  seq_dir: data/tst-fall-detection-32
+  manifest: data/tst-fall-detection-32/manifest.parquet       # создаётся скриптом
   val_frac: 0.1                         # доля валидации внутри тренировочных актёров
   window_size: 32                       # длина окна по временной оси
   window_stride: 1                      # шаг скольжения
   lopo: 1
   splits:
-    train: 0.8                       # fraction for training
-    val: 0.1                         # fraction for validation
-    test: 0.1                        # fraction for testing
+    train: 0.85                       # fraction for training
+    val: 0.15                         # fraction for validation
   class_names:
-    - standing
-    - sitting
-    - falling
-    - walking
-    - lying
-    - grasp
-    - ungrasp
-    - post-fall-laying
-
-  class_map:
+    standing: standing
+    sit-to-stand: standing
+    walking: walking
+    sitting: sitting
+    stand-to-sit: sitting
+    lay-to-sit: sitting
+    lying: lying
+    laying: lying
+    post-fall-laying: lying
+    sit-to-lay: lying
     grasp: grasp
     ungrasp: grasp
-    post-fall-laying: lying
-    stand-to-sit: sitting
-    sit-to-stand: standing
-    sit-to-lay: lying
-    lay-to-sit: sitting
-    laying: lying
+    falling: falling

@@ -50,12 +50,13 @@ class SeqWindow(Dataset):
 
 
 def get_dataloaders(cfg):
+    seed = cfg.get('seed')
     df = pd.read_parquet(cfg['data']['manifest'])
     leave = cfg['data']['lopo']
     win = cfg['data']['window_size']
     stride = cfg['data']['window_stride']
     class_map = cfg['data'].get('class_names', {})
-    class_names = set(class_map.values())
+    class_names = list(dict.fromkeys(class_map.values()))
     cls2idx = {c: i for i, c in enumerate(class_names)}
 
     # LOPO split
@@ -93,11 +94,24 @@ def get_dataloaders(cfg):
             cls2idx=cls2idx,
             class_names=class_names
         )
+        generator = None
+        worker_init_fn = None
+        if seed is not None:
+            generator = torch.Generator()
+            generator.manual_seed(int(seed))
+
+            def worker_init_fn(worker_id):
+                worker_seed = int(seed) + worker_id
+                np.random.seed(worker_seed)
+                torch.manual_seed(worker_seed)
+
         return DataLoader(
             dataset,
             batch_size=cfg['batch_size'],
             shuffle=(split == 'train'),
-            num_workers=cfg['num_workers']
+            num_workers=cfg['num_workers'],
+            generator=generator,
+            worker_init_fn=worker_init_fn,
         )
 
     return make_loader('train'), make_loader('val'), make_loader('test')

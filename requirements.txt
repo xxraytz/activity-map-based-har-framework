@@ -3,3 +3,8 @@ torchvision
 numpy
 pyyaml
 timm
+pandas
+scikit-learn
+tqdm
+optuna
+pyarrow

@@ -50,6 +50,8 @@ def main(cfg, run_dir, resume):
     set_seed(cfg.get('seed'))
     device = torch.device(cfg['device'] if torch.cuda.is_available() else 'cpu')
     train_loader, val_loader, test_loader = get_dataloaders(cfg)
+    with open(os.path.join(run_dir, "config.yaml"), "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
     
     if cfg['mode'] == 'train':
         epochs = cfg['epochs']

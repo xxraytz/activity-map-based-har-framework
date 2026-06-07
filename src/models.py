@@ -4,6 +4,7 @@
 import torch
 from torch import nn
 import timm
+from timm.models.vision_transformer import VisionTransformer
 
 
 class FlattenMLP(nn.Module):
@@ -28,6 +29,57 @@ class FlattenMLP(nn.Module):
     def forward(self, x):
         return self.net(torch.flatten(x, 1))
 
+
+class LateFusionCNN(nn.Module):
+    def __init__(self, backbone_name, in_chans, num_classes, pretrained=False, dropout=0.0):
+        super().__init__()
+        self.in_chans = int(in_chans)
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            num_classes=0,
+            in_chans=1,
+            global_pool='avg',
+        )
+        feat_dim = int(self.backbone.num_features)
+        self.head = nn.Sequential(
+            nn.Dropout(float(dropout)),
+            nn.Linear(feat_dim * self.in_chans, int(num_classes)),
+        )
+
+    def forward(self, x):
+        parts = []
+        for channel_idx in range(self.in_chans):
+            parts.append(self.backbone(x[:, channel_idx:channel_idx + 1]))
+        return self.head(torch.cat(parts, dim=1))
+
+
+class TinyViT32(VisionTransformer):
+    def __init__(
+        self,
+        img_size,
+        patch_size,
+        in_chans,
+        num_classes,
+        embed_dim=192,
+        depth=12,
+        num_heads=3,
+        mlp_ratio=4.0,
+        dropout=0.0,
+    ):
+        super().__init__(
+            img_size=int(img_size),
+            patch_size=int(patch_size),
+            in_chans=int(in_chans),
+            num_classes=int(num_classes),
+            embed_dim=int(embed_dim),
+            depth=int(depth),
+            num_heads=int(num_heads),
+            mlp_ratio=float(mlp_ratio),
+            qkv_bias=True,
+            drop_rate=float(dropout),
+        )
+
 def build_model(cfg):
     # Model expects (B, C, H, W), here H=N, W=window_size
 
@@ -41,6 +93,30 @@ def build_model(cfg):
             num_classes=cfg['num_classes'],
             hidden_dims=hidden_dims,
             dropout=dropout,
+        )
+
+    if cfg['model']['name'] == 'late_fusion_cnn':
+        model_cfg = cfg.get('model', {})
+        return LateFusionCNN(
+            backbone_name=model_cfg.get('backbone', 'resnet18'),
+            in_chans=cfg['in_chans'],
+            num_classes=cfg['num_classes'],
+            pretrained=model_cfg.get('pretrained', False),
+            dropout=model_cfg.get('dropout', 0.0),
+        )
+
+    if cfg['model']['name'] == 'vit_tiny_custom':
+        model_cfg = cfg.get('model', {})
+        return TinyViT32(
+            img_size=cfg['img_size'],
+            patch_size=model_cfg.get('patch_size', 4),
+            in_chans=cfg['in_chans'],
+            num_classes=cfg['num_classes'],
+            embed_dim=model_cfg.get('embed_dim', 192),
+            depth=model_cfg.get('depth', 12),
+            num_heads=model_cfg.get('num_heads', 3),
+            mlp_ratio=model_cfg.get('mlp_ratio', 4.0),
+            dropout=model_cfg.get('dropout', 0.0),
         )
 
     cfg['model_type'] = 'conv' if 'conv' in cfg['model']['name'] or 'resnet' in cfg['model']['name'] else 'transformer'

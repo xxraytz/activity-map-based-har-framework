@@ -208,9 +208,19 @@ __marimo__/
 
 
 # Datasets
-data/
-notebook/
-runs/
-
+/data/
+/notebook/
+/runs/
+scripts/local
 optuna_reports/
 optuna.db
+.local_artifacts/
+
+# Generated experiment artifacts
+reports/
+experiments/
+configs/planned-*/
+scripts/local/
+configs/abl-*/
+configs/baseline-*/
+configs/partwise-*/

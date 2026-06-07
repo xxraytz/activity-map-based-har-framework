@@ -1,29 +1,29 @@
-# src/datasets.py
-
-from collections import Counter
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import StratifiedShuffleSplit
+
+from src.data.io import load_npz_sequence
+from src.data.labels import build_label_mapping, window_distribution
+from src.data.normalization import SequenceNormalizer, fit_trainset_channel_stats, resolve_normalization_config
+from src.data.splits import make_lopo_splits
 
 
 class SeqWindow(Dataset):
-    def __init__(self, recs, win, stride, orig_to_merged, cls2idx, class_names):
+    def __init__(self, recs, win, stride, label_mapping, normalizer=None):
         self.recs = recs.reset_index(drop=True)
-        self.win = win
-        self.stride = stride
-        self.orig_to_merged = orig_to_merged
-        self.cls2idx = cls2idx
-        self.class_names = class_names
+        self.win = int(win)
+        self.stride = int(stride)
+        self.label_mapping = label_mapping
+        self.normalizer = normalizer or SequenceNormalizer()
         self.map = []
+
         for i, r in self.recs.iterrows():
-            labs = np.load(r.filepath, allow_pickle=True)['labels']
-            M = len(labs)
-            assert M == np.load(r.filepath, allow_pickle=True)['data'].shape[1], \
-                f'The number if elements {M} and {np.load(r.filepath, allow_pickle=True)["data"].shape} are unmatched'
-            
-            for s in range(0, M - self.win + 1, self.stride):
+            seq, labels = load_npz_sequence(r.filepath)
+            num_frames = len(labels)
+            assert num_frames == seq.shape[-1], \
+                f'The number if elements {num_frames} and {seq.shape} are unmatched'
+
+            for s in range(0, num_frames - self.win + 1, self.stride):
                 self.map.append((i, s))
 
     def __len__(self):
@@ -32,67 +32,32 @@ class SeqWindow(Dataset):
     def __getitem__(self, idx):
         rec_idx, start = self.map[idx]
         r = self.recs.iloc[rec_idx]
-        npz = np.load(r.filepath, allow_pickle=True)
-        seq = npz['data'].astype(np.float32)
-        
-        seq = seq if seq.ndim > 2 else seq[None, ...]
-        assert seq.ndim == 3, f'The {seq} tensor should have ndim == 3 or ndim == 2'
+        seq, labels = load_npz_sequence(r.filepath)
+        seq = self.normalizer(seq)
 
-        labs = npz['labels']
-        window = torch.tensor(seq[:, :, start:start + self.win])
-        wl = labs[start:start + self.win]
-        merged = [self.orig_to_merged.get(str(l), str(l)) for l in wl]
-        idxs = [self.cls2idx[m] for m in merged]
-        cnt = torch.bincount(torch.tensor(idxs), minlength=len(self.class_names)).float()
-
+        window = torch.from_numpy(seq[:, :, start:start + self.win])
+        target = window_distribution(labels[start:start + self.win], self.label_mapping)
         assert window.shape[-1] == self.win
-        return window, cnt / cnt.sum()
+        return window, target
 
 
 def get_dataloaders(cfg):
     seed = cfg.get('seed')
-    df = pd.read_parquet(cfg['data']['manifest'])
-    leave = cfg['data']['lopo']
     win = cfg['data']['window_size']
     stride = cfg['data']['window_stride']
-    class_map = cfg['data'].get('class_names', {})
-    class_names = list(dict.fromkeys(class_map.values()))
-    cls2idx = {c: i for i, c in enumerate(class_names)}
-
-    # LOPO split
-    test_df = df[df.actor_id == leave]
-    other = df[df.actor_id != leave].sample(frac=1, random_state=42)
-    
-    # --- доминирующий канонический класс каждой записи (по полному файлу)
-    def majority_canonical(filepath: str) -> str:
-        npz = np.load(filepath, allow_pickle=True)
-        labs = npz['labels']
-        merged = [class_map.get(str(l), str(l)) for l in labs]
-        return Counter(merged).most_common(1)[0][0]
-    
-    other_major = other['filepath'].apply(majority_canonical)
-
-    # --- стратификация other -> train/val
-    val_frac = cfg['data']['val_frac']
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=val_frac, random_state=42)
-    train_idx, val_idx = next(sss.split(other, other_major))
-    train_df = other.iloc[train_idx].reset_index(drop=True)
-    val_df   = other.iloc[val_idx].reset_index(drop=True)
-
-    splits = {
-        'train': train_df,
-        'val':   val_df,
-        'test':  test_df,
-    }
+    label_mapping = build_label_mapping(cfg['data'].get('class_names', {}))
+    splits = make_lopo_splits(cfg, label_mapping)
+    normalize = resolve_normalization_config(cfg['data'].get('normalize'), splits['train'])
+    cfg['data']['normalize'] = normalize
+    normalizer = SequenceNormalizer(normalize)
 
     def make_loader(split):
         dataset = SeqWindow(
             recs=splits[split],
             win=win,
             stride=stride,
-            orig_to_merged=class_map,
-            cls2idx=cls2idx,
-            class_names=class_names
+            label_mapping=label_mapping,
+            normalizer=normalizer,
         )
         generator = None
         worker_init_fn = None
@@ -112,6 +77,7 @@ def get_dataloaders(cfg):
             num_workers=cfg['num_workers'],
             generator=generator,
             worker_init_fn=worker_init_fn,
+            drop_last=(split == 'train'),
         )
 
     return make_loader('train'), make_loader('val'), make_loader('test')

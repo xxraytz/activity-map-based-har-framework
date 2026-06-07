@@ -1,0 +1,29 @@
+split: test
+output_dir: temporal_eval
+
+inference:
+  checkpoint: best.pth
+  batch_size: null
+  device: null
+
+pooling:
+  methods:
+    - max
+  topk: 3
+
+smoothing:
+  methods:
+    - moving_average
+  moving_average_kernel: 5
+  ema_alpha: 0.3
+  median_kernel: 5
+  hysteresis_threshold: 0.75
+  hysteresis_margin: 0.0
+  hysteresis_decay: 0.9
+
+segments:
+  decision_methods:
+    - mean_prob
+  min_confidence: 0.0
+  min_coverage: 0.5
+  min_length: 1

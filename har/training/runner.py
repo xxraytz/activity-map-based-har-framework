@@ -1,0 +1,342 @@
+# main.py
+import argparse
+import yaml
+import random
+import numpy as np
+import torch
+import os, csv, shutil, datetime
+from torch.optim import AdamW
+from har.data.datasets import get_dataloaders
+from har.models.factory import build_model
+from har.training.engine import train_epoch, validate
+from har.evaluation.metrics.evaluate import should_eval_metrics, evaluate_all, evaluate_split_metrics
+
+
+def resolve_monitor(cfg):
+    monitor_cfg = cfg.get('training', {}).get('monitor', {}) or {}
+    metric = monitor_cfg.get('metric', 'loss')
+    split = monitor_cfg.get('split', 'val')
+
+    if split not in {'train', 'val'}:
+        raise ValueError('Checkpoint selection requires train or val; test is reserved for evaluation.')
+
+    if metric in {'loss', 'val_loss'}:
+        return {'metric': 'loss', 'split': 'val', 'mode': 'min'}
+
+    mode = monitor_cfg.get('mode')
+    if mode is None:
+        mode = 'max' if any(token in metric for token in ('accuracy', 'f1', 'precision', 'recall')) else 'min'
+
+    if mode not in {'min', 'max'}:
+        raise ValueError(f"Unknown monitor mode: {mode}")
+    return {'metric': metric, 'split': split, 'mode': mode}
+
+
+def is_better_monitor(value, best_value, mode, min_delta):
+    if mode == 'min':
+        return value < (best_value - min_delta)
+    return value > (best_value + min_delta)
+
+
+def init_wandb(cfg, run_dir):
+    wandb_cfg = cfg.get('tracking', {}).get('wandb', {}) or {}
+    if not wandb_cfg.get('enabled', False):
+        return None
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ImportError("tracking.wandb.enabled=true, but wandb is not installed") from exc
+
+    init_kwargs = {
+        'project': wandb_cfg.get('project', 'human-action-recognition'),
+        'name': wandb_cfg.get('name') or os.path.basename(run_dir),
+        'dir': wandb_cfg.get('dir', run_dir),
+        'config': cfg,
+        'mode': wandb_cfg.get('mode', 'offline'),
+        'reinit': True,
+    }
+    if wandb_cfg.get('entity'):
+        init_kwargs['entity'] = wandb_cfg['entity']
+    if wandb_cfg.get('group'):
+        init_kwargs['group'] = wandb_cfg['group']
+    if wandb_cfg.get('tags'):
+        init_kwargs['tags'] = wandb_cfg['tags']
+    return wandb.init(**init_kwargs)
+
+def save_checkpoint(path, model, opt, sch, epoch, best_val, cfg, no_improve=0):
+    state = {
+        "model_state": model.state_dict(),
+        "optimizer_state": opt.state_dict(),
+        "scheduler_state": sch.state_dict() if sch is not None else None,
+        "epoch": epoch,
+        "best_val": best_val,
+        "no_improve": no_improve,
+        "config": cfg,
+        "torch_version": torch.__version__,
+    }
+    torch.save(state, path)
+
+def load_checkpoint(path, model, opt=None, sch=None, map_location="cpu"):
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+    if opt is not None and ckpt.get("optimizer_state") is not None:
+        opt.load_state_dict(ckpt["optimizer_state"])
+    if sch is not None and ckpt.get("scheduler_state") is not None:
+        sch.load_state_dict(ckpt["scheduler_state"])
+    return ckpt
+
+
+def set_seed(seed):
+    if seed is None:
+        return
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def main(cfg, run_dir, resume):
+    mode = cfg.get('mode', 'train')
+    if mode not in {'train', 'eval'}:
+        raise ValueError(f'Unknown mode: {mode}')
+    final_checkpoint = cfg.get('training', {}).get('final_checkpoint', 'best')
+    if final_checkpoint not in {'best', 'last'}:
+        raise ValueError(f'Unknown training.final_checkpoint: {final_checkpoint}')
+    if mode == 'eval':
+        if not resume:
+            raise ValueError('Evaluation requires --resume and an existing --run-dir.')
+        checkpoint = os.path.join(run_dir, f'{final_checkpoint}.pth')
+        if not os.path.isfile(checkpoint):
+            raise FileNotFoundError(f'Evaluation checkpoint does not exist: {checkpoint}')
+    resolve_monitor(cfg)
+    set_seed(cfg.get('seed'))
+    device = torch.device(cfg['device'] if torch.cuda.is_available() else 'cpu')
+    train_loader, val_loader, test_loader = get_dataloaders(cfg)
+    with open(os.path.join(run_dir, "config.yaml"), "w") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    wandb_run = init_wandb(cfg, run_dir)
+
+    if cfg['mode'] == 'train':
+        epochs = cfg['epochs']
+    else:
+        epochs = 0
+        assert resume, 'Checkpoint dir is not provided.'
+        print("Warning: Evaluation mode!")
+
+    # Early stopping
+    patience = int(cfg.get('training', {}).get('patience', 10))
+    min_delta = float(cfg.get('training', {}).get('min_delta', 0.0))
+    monitor = resolve_monitor(cfg)
+    no_improve = 0
+
+    model = build_model(cfg).to(device)
+    opt = AdamW(model.parameters(), lr=float(cfg['lr']), weight_decay=float(cfg['weight_decay']))
+    if cfg.get("model", {}).get("name") not in {"skeleton_1dcnn"}:
+        model_type_hint = cfg.get("model_type")
+        model_name = cfg.get("model", {}).get("name", "")
+        is_transformer = model_type_hint == "transformer" or (
+            model_type_hint is None and "resnet" not in model_name and "conv" not in model_name
+        )
+        if is_transformer:
+            assert cfg["img_size"] == cfg['data']['window_size']
+    sched_cfg = cfg.get('training', {}).get('lr_scheduler', {}) or {}
+    if sched_cfg.get('type', 'plateau') == 'plateau':
+        sch = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min',
+            factor=float(sched_cfg.get('factor', 0.5)),
+            patience=int(sched_cfg.get('patience', 3)),
+            threshold=float(sched_cfg.get('threshold', 1e-4)),
+            cooldown=int(sched_cfg.get('cooldown', 0)),
+            min_lr=float(sched_cfg.get('min_lr', 1e-6)),
+            # verbose=bool(sched_cfg.get('verbose', False)),
+        )
+    else:
+        sch = None  # 'none'
+    # sch = CosineAnnealingLR(opt, T_max=epochs)
+
+
+    # журнал
+    log_path = os.path.join(run_dir, "logs.csv")
+    is_new_log = not os.path.exists(log_path)
+    if is_new_log:
+        with open(log_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "monitor_metric",
+                "monitor_value",
+                "lr",
+                "best",
+                "no_improve",
+            ])
+
+    start_epoch = 1
+    best_val = float("inf") if monitor['mode'] == 'min' else -float("inf")
+
+    # resume
+    if resume:
+        ckpt_path = os.path.join(run_dir, "last.pth")
+        if not os.path.exists(ckpt_path):
+            fallback_path = os.path.join(run_dir, "best.pth")
+            if os.path.exists(fallback_path):
+                print(f"--resume: {ckpt_path} не найден, загружаю {fallback_path}.")
+                ckpt_path = fallback_path
+
+        if os.path.exists(ckpt_path):
+            ckpt = load_checkpoint(ckpt_path, model, opt, sch, map_location=device)
+            start_epoch = ckpt.get("epoch", 0) + 1
+            best_val = ckpt.get("best_val", float("inf"))
+            no_improve = ckpt.get("no_improve", 0)
+            print(f"Resumed from {ckpt_path} at epoch {start_epoch-1}, best_val={best_val:.4f}")
+        else:
+            print(f"--resume указан, но {ckpt_path} не найден. Стартуем заново.")
+
+    for ep in range(start_epoch, epochs+1):
+        task = cfg.get('task', 'multiclass')
+        tr_loss = train_epoch(model, train_loader, opt, device, epoch=ep, epochs=epochs, task=task)
+        val_loss = validate(model, val_loader, device, task=task)
+        monitor_value = val_loss
+        if monitor['metric'] != 'loss':
+            monitor_loader = {'val': val_loader, 'train': train_loader, 'test': test_loader}.get(monitor['split'])
+            if monitor_loader is None:
+                raise ValueError(f"Unknown monitor split: {monitor['split']}")
+            monitor_metrics = evaluate_split_metrics(model, monitor_loader, device, cfg)
+            if monitor['metric'] not in monitor_metrics:
+                raise ValueError(
+                    f"Monitor metric {monitor['metric']!r} is not configured. "
+                    f"Available metrics: {sorted(monitor_metrics)}"
+                )
+            monitor_value = float(monitor_metrics[monitor['metric']])
+
+        if sch is not None:
+            sch.step(val_loss)
+
+        improved = is_better_monitor(monitor_value, best_val, monitor['mode'], min_delta)
+        if improved:
+            best_val = monitor_value
+            no_improve = 0
+            save_checkpoint(os.path.join(run_dir, "best.pth"), model, opt, sch, ep, best_val, cfg)
+        else:
+            no_improve += 1
+
+        save_checkpoint(os.path.join(run_dir, "last.pth"), model, opt, sch, ep, best_val, cfg, no_improve)
+
+        monitor_name = f"{monitor['split']}_{monitor['metric']}"
+        with open(log_path, "a", newline="") as f:
+            csv.writer(f).writerow([
+                ep,
+                f"{tr_loss:.6f}",
+                f"{val_loss:.6f}",
+                monitor_name,
+                f"{monitor_value:.6f}",
+                f"{opt.param_groups[0]['lr']:.8f}",
+                int(improved),
+                no_improve,
+            ])
+
+        if wandb_run is not None:
+            wandb_run.log({
+                "epoch": ep,
+                "loss/train": tr_loss,
+                "loss/val": val_loss,
+                f"monitor/{monitor_name}": monitor_value,
+                "lr": opt.param_groups[0]['lr'],
+                "best": int(improved),
+                "no_improve": no_improve,
+            }, step=ep)
+
+        monitor_text = (
+            f", monitor={monitor['split']}_{monitor['metric']}={monitor_value:.4f}"
+            if monitor['metric'] != 'loss' else ""
+        )
+        print(f"Epoch {ep}: train_loss={tr_loss:.4f}, val_loss={val_loss:.4f}{monitor_text}"
+              + ("  [BEST]" if improved else f"  (no_improve={no_improve}/{patience})"))
+
+        if should_eval_metrics(cfg, ep):
+            loaders = {"train": train_loader, "val": val_loader, "test": test_loader}
+            metrics_by_split = evaluate_all(model, loaders, device, cfg, run_dir, epoch=ep)
+            if wandb_run is not None:
+                wandb_run.log({
+                    f"metrics/{split}/{metric}": value
+                    for split, split_metrics in metrics_by_split.items()
+                    for metric, value in split_metrics.items()
+                }, step=ep)
+
+        if patience > 0 and no_improve >= patience:
+            print(f"[EarlyStopping] Stop at epoch {ep}: no improvement for {no_improve} epochs (patience={patience}).")
+            break
+
+    # === Финальная оценка: грузим выбранный чекпоинт и считаем метрики ===
+    final_checkpoint = cfg.get('training', {}).get('final_checkpoint', 'best')
+    if final_checkpoint not in {'best', 'last'}:
+        raise ValueError(f"Unknown training.final_checkpoint: {final_checkpoint}")
+    final_ckpt_path = os.path.join(run_dir, f"{final_checkpoint}.pth")
+    if os.path.exists(final_ckpt_path):
+        ckpt = load_checkpoint(final_ckpt_path, model, map_location=device)  # opt/sch не обязателен
+        print(
+            f"[FINAL EVAL] Loaded {final_checkpoint} checkpoint: "
+            f"epoch={ckpt.get('epoch','?')}, best_val={ckpt.get('best_val', float('nan')):.6f}"
+        )
+    else:
+        print(f"[FINAL EVAL] {final_checkpoint}.pth не найден, оцениваю текущую модель.")
+
+    # loss на test именно для выбранного чекпоинта
+    test_loss = validate(model, test_loader, device, task=cfg.get('task', 'multiclass'))
+    print(f"[FINAL EVAL] Test loss ({final_checkpoint}): {test_loss:.4f}")
+
+    # метрики для выбранного чекпоинта
+    evaluate_all(
+        model=model,
+        loaders={"train": train_loader, "val": val_loader, "test": test_loader},
+        device=device,
+        cfg=cfg, run_dir=run_dir,
+        epoch=int(ckpt.get("epoch", -1)) if 'ckpt' in locals() else -1
+    )
+    if wandb_run is not None:
+        wandb_run.finish()
+
+def cli():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='configs/config.yaml')
+    parser.add_argument('--run-dir', type=str, default=None,
+                        help="Директория для логов/чекпоинтов. По умолчанию создаётся автоматически.")
+    parser.add_argument('--resume', action='store_true', help="Продолжить из runs/.../last.pth")
+    parser.add_argument('--seed', type=int, default=None, help="Override seed from config.")
+    parser.add_argument('--device', type=str, default=None, help="Override device from config, e.g. cuda:0.")
+    args = parser.parse_args()
+
+    with open(args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
+    if args.seed is not None:
+        cfg['seed'] = args.seed
+    if args.device is not None:
+        cfg['device'] = args.device
+
+    # создаём run_dir
+    if args.run_dir is None:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        name = cfg['model']['name'].split('.')[0]
+        run_dir = os.path.join("runs", f"{ts}_{name}")
+    else:
+        run_dir = args.run_dir
+    os.makedirs(run_dir, exist_ok=True)
+
+    # сохраним копию конфига
+    dst_cfg = os.path.join(run_dir, "config.yaml")
+    try:
+        if not os.path.exists(dst_cfg):
+            shutil.copyfile(args.config, dst_cfg)
+    except Exception as e:
+        print(f"Warn: cannot copy config to run_dir: {e}")
+
+    main(cfg, run_dir=run_dir, resume=args.resume)
+
+
+if __name__ == "__main__":
+    cli()

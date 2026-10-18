@@ -1,0 +1,53 @@
+batch_size: 128
+data:
+  class_names:
+    no_class: no_class
+    adl_sit: adl_sit
+    adl_grasp: adl_grasp
+    adl_walk: adl_walk
+    adl_lay: adl_lay
+    fall_front: fall_front
+    fall_back: fall_back
+    fall_side: fall_side
+    fall_endupsit: fall_endupsit
+  manifest: data/tst-video8-source-aware-5ch32/manifest-lopo-01.parquet
+  normalize:
+    eps: 1.0e-06
+    mode: trainset_channel_standard
+  seq_dir: data/tst-video8-source-aware-5ch32
+  splits:
+    train: 0.85
+    val: 0.15
+  val_frac: 0.1
+  window_size: 32
+  window_stride: 1
+  split_mode: manifest
+device: cuda:0
+epochs: 200
+img_size: 32
+in_chans: 5
+lr: 0.0015394809610535603
+metrics:
+  eval_every: 0
+  names:
+  - accuracy
+  - f1_macro
+mode: train
+model:
+  name: resnet18
+  pretrained: false
+num_classes: 9
+num_workers: 4
+seed: 42
+training:
+  lr_scheduler:
+    cooldown: 0
+    factor: 0.2
+    min_lr: 1.0e-06
+    patience: 3
+    threshold: 0.0001
+    type: plateau
+    verbose: false
+  min_delta: 0.0
+  patience: 30
+weight_decay: 1.0e-06
